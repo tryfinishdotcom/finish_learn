@@ -1,3 +1,4 @@
+// src/middleware/security.ts
 import rateLimit from 'express-rate-limit';
 import { Request, Response, NextFunction } from 'express';
 
@@ -8,6 +9,20 @@ const rateLimiter = rateLimit({
   message: 'Too many requests from this IP, please try again later',
   standardHeaders: true,
   legacyHeaders: false,
+  // Fix for Railway proxy
+  keyGenerator: (req: Request) => {
+    // Use the rightmost IP in the X-Forwarded-For header
+    const forwarded = req.headers['x-forwarded-for'] as string;
+    if (forwarded) {
+      const ips = forwarded.split(',');
+      return ips[ips.length - 1].trim();
+    }
+    return req.ip || 'unknown';
+  },
+  skip: (req: Request) => {
+    // Skip rate limiting for health checks
+    return req.path === '/health';
+  }
 });
 
 // Basic input sanitization
