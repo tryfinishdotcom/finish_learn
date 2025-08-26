@@ -54,9 +54,6 @@ app.get('/health', (req, res) => {
 // API routes
 app.use('/api', routes);
 
-// Sentry error handler (must be before other error handlers)
-app.use(Sentry.Handlers.errorRequestHandler());
-
 // Error handling
 app.use(errorHandler);
 
