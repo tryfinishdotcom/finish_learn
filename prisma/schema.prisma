@@ -1,0 +1,76 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model LessonProgress {
+  id              Int       @id @default(autoincrement())
+  memberId        String    @map("member_id")
+  lessonSlug      String    @map("lesson_slug")
+  courseSlug      String    @map("course_slug")
+  secondsWatched  Int       @default(0) @map("seconds_watched")
+  totalDuration   Int       @default(0) @map("total_duration")
+  percentComplete Int       @default(0) @map("percent_complete")
+  lastPosition    Int       @default(0) @map("last_position")
+  completedAt     DateTime? @map("completed_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@unique([memberId, lessonSlug])
+  @@index([memberId])
+  @@map("lesson_progress")
+}
+
+model CourseProgress {
+  id              Int      @id @default(autoincrement())
+  memberId        String   @map("member_id")
+  courseSlug      String   @map("course_slug")
+  lastLessonSlug  String?  @map("last_lesson_slug")
+  lastLessonUrl   String?  @map("last_lesson_url")
+  lastLessonTitle String?  @map("last_lesson_title")
+  lastLessonIndex String?  @map("last_lesson_index")
+  accessedAt      DateTime @default(now()) @map("accessed_at")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@unique([memberId, courseSlug])
+  @@index([memberId])
+  @@map("course_progress")
+}
+
+model LessonTodo {
+  id          Int       @id @default(autoincrement())
+  memberId    String    @map("member_id")
+  lessonSlug  String    @map("lesson_slug")
+  todoId      String    @map("todo_id")
+  isCompleted Boolean   @default(false) @map("is_completed")
+  completedAt DateTime? @map("completed_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  @@unique([memberId, lessonSlug, todoId])
+  @@index([memberId])
+  @@index([memberId, lessonSlug])
+  @@map("lesson_todos")
+}
+
+model UserLastLesson {
+  id          Int      @id @default(autoincrement())
+  memberId    String   @unique @map("member_id")
+  lessonSlug  String   @map("lesson_slug")
+  courseSlug  String   @map("course_slug")
+  url         String?
+  title       String?
+  headline    String?
+  lessonIndex String?  @map("lesson_index")
+  accessedAt  DateTime @default(now()) @map("accessed_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("user_last_lesson")
+}
