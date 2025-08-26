@@ -19,7 +19,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Trust proxy - required for Railway/reverse proxy setups
-app.set('trust proxy', true);
+app.set('trust proxy', 1);
 
 // Initialize Sentry
 initSentry(app);
@@ -30,7 +30,7 @@ app.use(cors({
   origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Member-ID'] // ADD X-Member-ID here
 }));
 
 // Body parsing and compression
