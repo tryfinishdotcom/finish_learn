@@ -14,8 +14,10 @@ export const syncController = {
         prisma.userLastLesson.findUnique({ where: { memberId } })
       ]);
 
-      // Transform to frontend format
+      // Transform lesson progress to frontend format
       const progressByLesson: Record<string, any> = {};
+      const lessonToCourseMap = new Map<string, string>();
+      
       lessonProgress.forEach(p => {
         progressByLesson[p.lessonSlug] = {
           sec: p.secondsWatched,
@@ -24,8 +26,10 @@ export const syncController = {
           courseSlug: p.courseSlug,
           ts: p.updatedAt.getTime()
         };
+        lessonToCourseMap.set(p.lessonSlug, p.courseSlug);
       });
 
+      // Transform course progress to frontend format
       const courseProgressMap: Record<string, any> = {};
       courseProgress.forEach(c => {
         courseProgressMap[c.courseSlug] = {
@@ -37,20 +41,33 @@ export const syncController = {
         };
       });
 
-      const todosByLesson: Record<string, Record<string, boolean>> = {};
+      // Transform todos to new course-based structure
+      const todosByCourse: Record<string, Record<string, Record<string, boolean>>> = {};
+      
       todos.forEach(t => {
-        if (!todosByLesson[t.lessonSlug]) {
-          todosByLesson[t.lessonSlug] = {};
+        const courseSlug = lessonToCourseMap.get(t.lessonSlug);
+        
+        if (courseSlug) {
+          // Initialize course object if doesn't exist
+          if (!todosByCourse[courseSlug]) {
+            todosByCourse[courseSlug] = {};
+          }
+          // Initialize lesson object if doesn't exist
+          if (!todosByCourse[courseSlug][t.lessonSlug]) {
+            todosByCourse[courseSlug][t.lessonSlug] = {};
+          }
+          // Set todo state
+          todosByCourse[courseSlug][t.lessonSlug][t.todoId] = t.isCompleted;
         }
-        todosByLesson[t.lessonSlug][t.todoId] = t.isCompleted;
       });
 
-      res.json({
+      // Prepare response
+      const response: any = {
         success: true,
         data: {
           progressByLesson,
           courseProgress: courseProgressMap,
-          todos: todosByLesson,
+          todosByCourse, // New course-based structure
           lastLesson: lastLesson ? {
             lessonSlug: lastLesson.lessonSlug,
             courseSlug: lastLesson.courseSlug,
@@ -61,7 +78,19 @@ export const syncController = {
             ts: lastLesson.accessedAt.getTime()
           } : null
         }
+      };
+
+      // Include legacy todos format for backward compatibility
+      const todosByLesson: Record<string, Record<string, boolean>> = {};
+      todos.forEach(t => {
+        if (!todosByLesson[t.lessonSlug]) {
+          todosByLesson[t.lessonSlug] = {};
+        }
+        todosByLesson[t.lessonSlug][t.todoId] = t.isCompleted;
       });
+      response.data.todos = todosByLesson;
+
+      res.json(response);
     } catch (error) {
       console.error('Sync error:', error);
       res.status(500).json({ error: 'Failed to sync data' });
