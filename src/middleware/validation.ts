@@ -33,5 +33,14 @@ export const todoValidation = {
   getTodos: [
     param('lessonSlug').isString().notEmpty().withMessage('lessonSlug is required'),
     validateRequest
+  ],
+  saveCourseTodos: [
+    param('courseSlug').isString().notEmpty().withMessage('courseSlug is required'),
+    body('todos').isObject().withMessage('todos must be an object'),
+    validateRequest
+  ],
+  getCourseTodos: [
+    param('courseSlug').isString().notEmpty().withMessage('courseSlug is required'),
+    validateRequest
   ]
 };
