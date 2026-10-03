@@ -9,16 +9,9 @@ const rateLimiter = rateLimit({
   message: 'Too many requests from this IP, please try again later',
   standardHeaders: true,
   legacyHeaders: false,
-  // Fix for Railway proxy
-  keyGenerator: (req: Request) => {
-    // Use the rightmost IP in the X-Forwarded-For header
-    const forwarded = req.headers['x-forwarded-for'] as string;
-    if (forwarded) {
-      const ips = forwarded.split(',');
-      return ips[ips.length - 1].trim();
-    }
-    return req.ip || 'unknown';
-  },
+  // Keyed on req.ip (the library default): the client address resolved by the app's
+  // 'trust proxy' hop count, see src/app.ts. Never parse X-Forwarded-For by hand here:
+  // its rightmost entry is Railway's CDN edge, shared by every learner.
   skip: (req: Request) => {
     // Skip rate limiting for health checks
     return req.path === '/health';
