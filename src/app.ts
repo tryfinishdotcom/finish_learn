@@ -47,6 +47,7 @@ export function createApp(): Express {
 
   // Security middleware
   app.use(securityMiddleware.rateLimiter);
+  app.use(securityMiddleware.progressSaveRateLimiter);
   app.use(securityMiddleware.sanitizeInput);
 
   // Health check

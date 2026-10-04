@@ -19,6 +19,7 @@ before(async () => {
   // The rate limiter reads its limits when its module loads, so set them before importing.
   process.env.RATE_LIMIT_MAX_REQUESTS = '2';
   process.env.RATE_LIMIT_WINDOW_MS = '60000';
+  process.env.RATE_LIMIT_PROGRESS_MAX_REQUESTS = '4';
   delete process.env.SENTRY_DSN;
   process.env.NODE_ENV = 'test';
 
@@ -198,4 +199,58 @@ test('a single-entry X-Forwarded-For (no CDN hop) still keys on the client', asy
   } finally {
     await close(server);
   }
+});
+
+test('lesson progress saves have their own, larger per-client budget', async () => {
+  // The lesson player saves progress every 5 s while a video plays (~180 saves per
+  // 15 min), far above the general limit. Saves get their own bucket (4 here, 600 by
+  // default) and do not use up the client's general bucket (2 here, 100 by default).
+  const { server, port } = await listen(createApp());
+  const xff = '198.51.100.41, 152.233.12.241';
+  const save = (path = '/api/progress/lesson') =>
+    fetch(`http://127.0.0.1:${port}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': xff },
+      body: '{}',
+    });
+  const other = () =>
+    fetch(`http://127.0.0.1:${port}/api/does-not-exist`, { headers: { 'X-Forwarded-For': xff } });
+  try {
+    for (let i = 0; i < 3; i++) {
+      assert.notEqual((await save()).status, 429, `save ${i + 1} is within the progress budget`);
+    }
+    // Path variants that Express routes to the same handler count against the same bucket.
+    assert.notEqual((await save('/api/progress/lesson/')).status, 429);
+    assert.equal((await save('/API/Progress/Lesson')).status, 429, 'the 5th save exceeds the budget of 4');
+
+    const res = await other();
+    assert.equal(res.status, 404, 'saves did not use up the general bucket');
+    assert.equal(res.headers.get('ratelimit-remaining'), '1');
+  } finally {
+    await close(server);
+  }
+});
+
+test('other routes keep the general limit', async () => {
+  const { server, port } = await listen(createApp());
+  const xff = '198.51.100.42, 152.233.12.241';
+  const get = (path: string) =>
+    fetch(`http://127.0.0.1:${port}${path}`, { headers: { 'X-Forwarded-For': xff } });
+  try {
+    // A GET on the save path is not a save: it uses the general bucket.
+    assert.notEqual((await get('/api/progress/lesson')).status, 429);
+    assert.notEqual((await get('/api/progress/lessons')).status, 429);
+    assert.equal((await get('/api/progress/lessons')).status, 429);
+  } finally {
+    await close(server);
+  }
+});
+
+test('the progress-save budget defaults to 600 per 15 minutes', async () => {
+  const { progressSaveLimit } = await import('./middleware/security');
+  assert.deepEqual(progressSaveLimit({}), { windowMs: 900000, max: 600 });
+  assert.deepEqual(
+    progressSaveLimit({ RATE_LIMIT_WINDOW_MS: '60000', RATE_LIMIT_PROGRESS_MAX_REQUESTS: '900' }),
+    { windowMs: 60000, max: 900 }
+  );
 });
