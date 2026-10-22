@@ -24,6 +24,8 @@ let describeAuthMode: typeof import('./middleware/auth').describeAuthMode;
 let memberIdFallbackState: typeof import('./middleware/auth').memberIdFallbackState;
 let jwksUrl: string;
 let jwksHits = 0;
+let jwksDown = false;
+let setClockForTests: typeof import('./config/memberstack').setClockForTests;
 const authLines: string[] = [];
 const realLog = console.log;
 const inHours = (h: number) => new Date(Date.now() + h * 3600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -32,6 +34,11 @@ before(async () => {
   const jwk = { ...signing.publicKey.export({ format: 'jwk' }), kid: KID, alg: 'RS256', use: 'sig' };
   jwksServer = http.createServer((_req, res) => {
     jwksHits++;
+    if (jwksDown) {
+      res.statusCode = 500;
+      res.end('down');
+      return;
+    }
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ keys: [jwk] }));
   });
@@ -50,7 +57,7 @@ before(async () => {
   const { authenticateUser } = auth;
   describeAuthMode = auth.describeAuthMode;
   memberIdFallbackState = auth.memberIdFallbackState;
-  ({ memberstackConfig } = await import('./config/memberstack'));
+  ({ memberstackConfig, setClockForTests } = await import('./config/memberstack'));
 
   const app = express();
   app.get('/me', authenticateUser, (req, res) => {
@@ -76,6 +83,8 @@ beforeEach(() => {
 
 afterEach(() => {
   authLines.length = 0;
+  jwksDown = false;
+  setClockForTests(null);
   for (const [k, v] of Object.entries(savedEnv)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
@@ -271,6 +280,45 @@ test('an unreachable key source answers 503, not 401, and admits nobody', async 
   } finally {
     console.error = realError;
   }
+});
+
+async function quietly<T>(fn: () => Promise<T>): Promise<T> {
+  const realError = console.error;
+  console.error = () => {};
+  try {
+    return await fn();
+  } finally {
+    console.error = realError;
+  }
+}
+
+test('key source down after keys loaded: known key works within the hour, then 503', async () => {
+  process.env.MEMBERSTACK_JWKS_URL = `${jwksUrl}?case=trust`;
+  let now = Date.now();
+  setClockForTests(() => now);
+  assert.equal((await me(sign({ id: 'mem_trust1' }))).status, 200);
+  jwksDown = true;
+  now += 11 * 60 * 1000; // stale, refresh fails, keys still trusted
+  assert.equal((await quietly(() => me(sign({ id: 'mem_trust2' })))).status, 200);
+  now += 50 * 60 * 1000; // past an hour since the last good fetch
+  const late = await quietly(() => me(sign({ id: 'mem_trust3' })));
+  assert.equal(late.status, 503);
+  assert.equal(late.body.userId, undefined);
+});
+
+test('a new key id while the key source is failing answers 503, not 401', async () => {
+  process.env.MEMBERSTACK_JWKS_URL = `${jwksUrl}?case=rotation`;
+  let now = Date.now();
+  setClockForTests(() => now);
+  assert.equal((await me(sign({ id: 'mem_rot1' }))).status, 200);
+  jwksDown = true;
+  now += 31 * 1000;
+  const rotated = await quietly(() => me(sign({ id: 'mem_rot2' }, { kid: 'rotated-key' })));
+  assert.equal(rotated.status, 503);
+  // Once the source recovers, an unknown key id is a plain rejection again.
+  jwksDown = false;
+  now += 31 * 1000;
+  assert.equal((await me(sign({ id: 'mem_rot3' }, { kid: 'rotated-key' }))).status, 401);
 });
 
 test('a key source override without HTTPS is refused (503), never trusted', async () => {

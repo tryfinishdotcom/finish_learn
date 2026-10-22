@@ -2,7 +2,7 @@
 // Run with `npm run test:e2e`. Needs TEST_DATABASE_URL pointing at a throwaway Postgres
 // database on localhost with the schema pushed (`DATABASE_URL=$TEST_DATABASE_URL npx
 // prisma db push`). It refuses any other host and any database holding rows of
-// learners other than its own `mem_e2e…` fixtures, and only ever deletes those.
+// learners other than `mem_e2e…` fixtures, and deletes only this run's own fixtures.
 // Drives the real app (routes, controllers, Prisma) with RS256 tokens signed by a
 // throwaway key served from a local JWKS endpoint.
 import { test, before, after } from 'node:test';
@@ -16,9 +16,11 @@ import type { PrismaClient } from '@prisma/client';
 const KID = 'e2e-key-1';
 const APP_ID = 'app_cmde998dl011d0wx92d1xae1y';
 const ISSUER = 'https://api.memberstack.com';
+// Fixture learners are unique per run and the only rows this test ever deletes.
 const FIXTURE_PREFIX = 'mem_e2e';
-const A = 'mem_e2eLearnerA';
-const B = 'mem_e2eLearnerB';
+const RUN = crypto.randomBytes(6).toString('hex');
+const A = `${FIXTURE_PREFIX}${RUN}A`;
+const B = `${FIXTURE_PREFIX}${RUN}B`;
 const signing = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
 
 const dbUrl = process.env.TEST_DATABASE_URL;
@@ -99,11 +101,6 @@ before(async () => {
     prisma.lessonTodo.count({ where: foreign }), prisma.userLastLesson.count({ where: foreign }),
   ])).reduce((a, b) => a + b, 0);
   if (foreignRows > 0) throw new Error(`refusing: TEST_DATABASE_URL holds ${foreignRows} rows of other learners`);
-  const ours = { memberId: { startsWith: FIXTURE_PREFIX } };
-  await prisma.$transaction([
-    prisma.lessonTodo.deleteMany({ where: ours }), prisma.lessonProgress.deleteMany({ where: ours }),
-    prisma.courseProgress.deleteMany({ where: ours }), prisma.userLastLesson.deleteMany({ where: ours }),
-  ]);
   const { createApp } = await import('./app');
   appServer = http.createServer(createApp());
   await new Promise<void>((r) => appServer.listen(0, '127.0.0.1', r));
@@ -116,6 +113,13 @@ after(async () => {
     if (!server) continue;
     server.closeAllConnections();
     await new Promise<void>((r) => server.close(() => r()));
+  }
+  if (prisma && appServer) {
+    const ours = { memberId: { in: [A, B] } };
+    await prisma.$transaction([
+      prisma.lessonTodo.deleteMany({ where: ours }), prisma.lessonProgress.deleteMany({ where: ours }),
+      prisma.courseProgress.deleteMany({ where: ours }), prisma.userLastLesson.deleteMany({ where: ours }),
+    ]);
   }
   await prisma?.$disconnect();
 });

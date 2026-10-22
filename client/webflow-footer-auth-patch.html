@@ -8,6 +8,8 @@
   var proto = Object.getPrototypeOf(api);
   var PENDING_PREFIX = 'learningAPI:pending:';
   var PENDING_MAX = 200;
+  var lastSeq = 0;
+  function nextSeq() { lastSeq = Math.max(Date.now(), lastSeq + 1); return lastSeq; }
 
   // Memberstack's session token (JWT), as $memberstackDom.getMemberCookie() returns it.
   // The backend accepts only this; a member id alone proves nothing.
@@ -25,8 +27,8 @@
     } catch (e) { return null; }
   };
 
-  // Member id inside the token (unverified, only to avoid replaying one learner's queued
-  // saves under another learner's session on a shared browser).
+  // Member id inside the token (unverified; only used so one learner's queued saves are
+  // never sent under another learner's session on a shared browser).
   function tokenMemberId(token) {
     try {
       var part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
@@ -43,44 +45,50 @@
     return !!(this.memberId && this.token);
   };
 
-  // Saves that did not reach the backend, per learner, latest per lesson/course. They
-  // are sent again after the next successful backend call.
+  // Saves that did not reach the backend, per learner, one entry per lesson/course with
+  // the time the save was made. A success clears only entries made before it started.
   function pendingKeyFor(endpoint, options) {
     var lesson = '';
     try { lesson = JSON.parse(options.body || '{}').lessonSlug || ''; } catch (e) {}
     return (options.method || 'GET').toUpperCase() + ' ' + endpoint + (lesson ? ' ' + lesson : '');
   }
-  function readPending(memberId) {
-    try { return JSON.parse(localStorage.getItem(PENDING_PREFIX + memberId) || '{}'); } catch (e) { return {}; }
+  function readPending(owner) {
+    try { return JSON.parse(localStorage.getItem(PENDING_PREFIX + owner) || '{}'); } catch (e) { return {}; }
   }
-  function writePending(memberId, pending) {
+  function writePending(owner, pending) {
     try {
-      var keys = Object.keys(pending).sort(function (a, b) { return pending[a].ts - pending[b].ts; });
+      var keys = Object.keys(pending).sort(function (a, b) { return pending[a].seq - pending[b].seq; });
       while (keys.length > PENDING_MAX) delete pending[keys.shift()];
-      if (keys.length) localStorage.setItem(PENDING_PREFIX + memberId, JSON.stringify(pending));
-      else localStorage.removeItem(PENDING_PREFIX + memberId);
+      if (keys.length) localStorage.setItem(PENDING_PREFIX + owner, JSON.stringify(pending));
+      else localStorage.removeItem(PENDING_PREFIX + owner);
     } catch (e) {}
   }
-  proto.queueWrite = function (endpoint, options) {
-    if (!this.memberId) return;
-    var pending = readPending(this.memberId);
-    pending[pendingKeyFor(endpoint, options)] = { endpoint: endpoint, method: options.method, body: options.body, ts: Date.now() };
-    writePending(this.memberId, pending);
-  };
-  proto.clearQueued = function (endpoint, options) {
-    if (!this.memberId) return;
-    var pending = readPending(this.memberId);
+  function queueWrite(owner, endpoint, options, seq) {
+    if (!owner) return;
+    var pending = readPending(owner);
     var key = pendingKeyFor(endpoint, options);
-    if (pending[key]) { delete pending[key]; writePending(this.memberId, pending); }
-  };
+    if (pending[key] && pending[key].seq > seq) return; // a newer save is already queued
+    pending[key] = { endpoint: endpoint, method: options.method, body: options.body, seq: seq };
+    writePending(owner, pending);
+  }
+  function clearQueued(owner, endpoint, options, seq) {
+    var pending = readPending(owner);
+    var key = pendingKeyFor(endpoint, options);
+    if (pending[key] && pending[key].seq <= seq) { delete pending[key]; writePending(owner, pending); }
+  }
+
   proto.flushQueued = async function () {
-    if (this.flushing || !this.memberId || tokenMemberId(this.token) !== this.memberId) return;
+    if (this.flushing) return;
+    var owner = this.memberId;
+    if (!owner || tokenMemberId(this.token) !== owner) return;
     this.flushing = true;
     try {
-      var pending = readPending(this.memberId);
+      var pending = readPending(owner);
       for (var key in pending) {
         var item = pending[key];
-        try { await this.request(item.endpoint, { method: item.method, body: item.body }); } catch (e) { break; }
+        try {
+          await this.request(item.endpoint, { method: item.method, body: item.body, owner: owner, seq: item.seq });
+        } catch (e) { break; }
       }
     } finally { this.flushing = false; }
   };
@@ -88,14 +96,22 @@
   proto.request = async function (endpoint, options) {
     options = options || {};
     var isWrite = /^(POST|PUT|PATCH|DELETE)$/i.test(options.method || 'GET');
-    if (this.authExpired || !this.getMemberstackData()) {
-      if (isWrite) this.queueWrite(endpoint, options);
+    var seq = options.seq || nextSeq();
+    var fetchOptions = Object.assign({}, options);
+    delete fetchOptions.owner; delete fetchOptions.seq;
+    var ready = !this.authExpired && this.getMemberstackData();
+    var owner = this.memberId;
+    if (options.owner && (owner !== options.owner || tokenMemberId(this.token) !== options.owner)) {
+      throw new Error('Account changed'); // replay of another learner's save: never send
+    }
+    if (!ready) {
+      if (isWrite) queueWrite(owner, endpoint, fetchOptions, seq);
       throw new Error('No authentication');
     }
     var self = this;
     var send = function (token) {
-      return fetch(self.baseURL + endpoint, Object.assign({}, options, {
-        headers: Object.assign({ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, options.headers)
+      return fetch(self.baseURL + endpoint, Object.assign({}, fetchOptions, {
+        headers: Object.assign({ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, fetchOptions.headers)
       }));
     };
     var sent = this.token;
@@ -107,23 +123,26 @@
         // once if the token now differs from the one this request sent.
         try { if (window.$memberstackDom) await window.$memberstackDom.getCurrentMember(); } catch (e) {}
         var fresh = this.getAuthToken();
-        if (fresh && fresh !== sent) { sent = fresh; this.token = fresh; response = await send(fresh); }
+        if (fresh && fresh !== sent && tokenMemberId(fresh) === tokenMemberId(sent)) {
+          sent = fresh; this.token = fresh; response = await send(fresh);
+        }
       }
     } catch (networkError) {
-      if (isWrite) this.queueWrite(endpoint, options);
+      if (isWrite) queueWrite(owner, endpoint, fetchOptions, seq);
       throw networkError;
     }
     if (!response.ok) {
-      if (isWrite) this.queueWrite(endpoint, options);
+      if (isWrite) queueWrite(owner, endpoint, fetchOptions, seq);
       // Only the newest token can expire the session; a late 401 for an older token
       // must not lock out a session that has since been renewed.
       if (response.status === 401 && this.getAuthToken() === sent) this.onAuthExpired();
       throw new Error('API Error: ' + response.status);
     }
-    if (isWrite) this.clearQueued(endpoint, options);
-    if (!this.flushing) this.flushQueued();
+    if (isWrite) clearQueued(owner, endpoint, fetchOptions, seq);
     var data = await response.json();
-    return data.data || data;
+    var result = data.data || data;
+    if (!this.flushing) this.flushQueued();
+    return result;
   };
 
   // Session no longer valid: stop calling the backend from this page (saves are queued

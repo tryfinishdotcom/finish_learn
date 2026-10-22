@@ -23,30 +23,47 @@ export function memberstackConfig(env: Env): { jwksUri: string; issuer: string; 
   };
 }
 
-// Signing keys per key source. Known keys are served from memory for 10 minutes. A
-// token naming an unknown key id triggers at most one refetch per 30 s, so a stream of
-// made-up key ids cannot crowd out the refresh of the real key. If a refresh fails,
-// the keys already loaded stay in use.
+// Signing keys per key source. Known keys are served from memory and refreshed after
+// 10 minutes. A token naming an unknown key id triggers at most one refetch per 30 s,
+// so a stream of made-up key ids cannot crowd out the refresh of the real key. If a
+// refresh fails, the keys already loaded stay in use for at most an hour after their
+// last successful fetch; past that, or when a key id is unknown while the source is
+// failing, verification cannot complete and callers answer 503.
 const KEYS_MAX_AGE_MS = 10 * 60 * 1000;
+const KEYS_MAX_TRUST_MS = 60 * 60 * 1000;
 const REFETCH_MIN_INTERVAL_MS = 30 * 1000;
 const COLD_RETRY_MS = 5 * 1000; // no keys loaded yet and the last fetch failed
 type KeySet = { keys: Map<string, string>; fetchedAt: number };
 const keySets = new Map<string, KeySet>();
 const lastFetchAttempt = new Map<string, number>();
+const lastFetchFailed = new Map<string, boolean>();
 const inflight = new Map<string, Promise<KeySet>>();
+
+let clock = () => Date.now();
+// Tests only: move time without waiting.
+export function setClockForTests(fn: (() => number) | null): void {
+  clock = fn ?? (() => Date.now());
+}
 
 function fetchKeySet(uri: string): Promise<KeySet> {
   let pending = inflight.get(uri);
   if (!pending) {
-    lastFetchAttempt.set(uri, Date.now());
+    lastFetchAttempt.set(uri, clock());
     pending = jwksRsa({ jwksUri: uri, cache: false, rateLimit: false, timeout: 5000 })
       .getSigningKeys()
-      .then((signingKeys) => {
-        const set: KeySet = { keys: new Map(), fetchedAt: Date.now() };
-        for (const k of signingKeys) set.keys.set(k.kid ?? '', k.getPublicKey());
-        keySets.set(uri, set);
-        return set;
-      })
+      .then(
+        (signingKeys) => {
+          const set: KeySet = { keys: new Map(), fetchedAt: clock() };
+          for (const k of signingKeys) set.keys.set(k.kid ?? '', k.getPublicKey());
+          keySets.set(uri, set);
+          lastFetchFailed.set(uri, false);
+          return set;
+        },
+        (error) => {
+          lastFetchFailed.set(uri, true);
+          throw error;
+        }
+      )
       .finally(() => inflight.delete(uri));
     inflight.set(uri, pending);
   }
@@ -60,12 +77,12 @@ function lookup(set: KeySet, kid: string | undefined): string | undefined {
 
 async function signingKeyFor(uri: string, kid: string | undefined): Promise<string | undefined> {
   let set = keySets.get(uri);
-  const now = Date.now();
-  const mayFetch = now - (lastFetchAttempt.get(uri) ?? 0) >= REFETCH_MIN_INTERVAL_MS;
-  const stale = !set || now - set.fetchedAt > KEYS_MAX_AGE_MS;
+  const now = clock();
   if (!set && !inflight.has(uri) && now - (lastFetchAttempt.get(uri) ?? 0) < COLD_RETRY_MS) {
     throw new KeySourceUnavailableError('key fetch failed moments ago');
   }
+  const mayFetch = now - (lastFetchAttempt.get(uri) ?? 0) >= REFETCH_MIN_INTERVAL_MS;
+  const stale = !set || now - set.fetchedAt > KEYS_MAX_AGE_MS;
   if (!set || (mayFetch && (stale || lookup(set, kid) === undefined))) {
     try {
       set = await fetchKeySet(uri);
@@ -73,7 +90,14 @@ async function signingKeyFor(uri: string, kid: string | undefined): Promise<stri
       if (!set) throw new KeySourceUnavailableError(error);
     }
   }
-  return lookup(set!, kid);
+  if (clock() - set!.fetchedAt > KEYS_MAX_TRUST_MS) {
+    throw new KeySourceUnavailableError('signing keys older than an hour and the key source is failing');
+  }
+  const key = lookup(set!, kid);
+  if (!key && lastFetchFailed.get(uri)) {
+    throw new KeySourceUnavailableError('unknown key id while the key source is failing');
+  }
+  return key;
 }
 
 // Thrown when Memberstack's signing keys cannot be fetched (network error, key source
