@@ -76,6 +76,10 @@ function lookup(set: KeySet, kid: string | undefined): string | undefined {
 }
 
 async function signingKeyFor(uri: string, kid: string | undefined): Promise<string | undefined> {
+  // A refresh already under way decides for this request too (its outcome sets
+  // lastFetchFailed), so a concurrent request cannot misread an outage as a bad key.
+  const running = inflight.get(uri);
+  if (running) await running.catch(() => undefined);
   let set = keySets.get(uri);
   const now = clock();
   if (!set && !inflight.has(uri) && now - (lastFetchAttempt.get(uri) ?? 0) < COLD_RETRY_MS) {

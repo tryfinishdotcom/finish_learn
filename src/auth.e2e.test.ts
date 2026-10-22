@@ -170,6 +170,18 @@ test('A token plus B named in header, body or query: scoped to A, B unchanged', 
   assert.ok(aRows.todos.some((t) => t.todoId === 't9'));
 });
 
+test('a late or replayed lower save never moves progress backwards', e2e, async () => {
+  const a = token(A);
+  assert.equal((await call('POST', '/progress/lesson', a, lesson('lesson-z', 90))).status, 200);
+  const stale = await call('POST', '/progress/lesson', a, lesson('lesson-z', 10));
+  assert.equal(stale.status, 200);
+  const row = (await rowsFor(A)).lessons.find((l) => l.lessonSlug === 'lesson-z');
+  assert.equal(row?.percentComplete, 90);
+  assert.equal(row?.secondsWatched, 90);
+  assert.ok(row?.completedAt, 'stays completed');
+  assert.equal(stale.json?.data?.percentComplete, 90);
+});
+
 test('no, malformed, fabricated, expired or foreign tokens: 401, nothing read or written', e2e, async () => {
   const before = await totalRows();
   const foreign = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });

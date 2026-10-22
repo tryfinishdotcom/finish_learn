@@ -46,35 +46,49 @@
   };
 
   // Saves that did not reach the backend, per learner, one entry per lesson/course with
-  // the time the save was made. A success clears only entries made before it started.
+  // the time the save was made. Per learner we also remember the newest save time that
+  // succeeded per lesson/course, so an older save is never queued or sent after it.
+  var ACKED_PREFIX = 'learningAPI:acked:';
   function pendingKeyFor(endpoint, options) {
     var lesson = '';
     try { lesson = JSON.parse(options.body || '{}').lessonSlug || ''; } catch (e) {}
     return (options.method || 'GET').toUpperCase() + ' ' + endpoint + (lesson ? ' ' + lesson : '');
   }
-  function readPending(owner) {
-    try { return JSON.parse(localStorage.getItem(PENDING_PREFIX + owner) || '{}'); } catch (e) { return {}; }
+  function readMap(prefix, owner) {
+    try { return JSON.parse(localStorage.getItem(prefix + owner) || '{}'); } catch (e) { return {}; }
   }
-  function writePending(owner, pending) {
+  function writeMap(prefix, owner, map, seqOf) {
     try {
-      var keys = Object.keys(pending).sort(function (a, b) { return pending[a].seq - pending[b].seq; });
-      while (keys.length > PENDING_MAX) delete pending[keys.shift()];
-      if (keys.length) localStorage.setItem(PENDING_PREFIX + owner, JSON.stringify(pending));
-      else localStorage.removeItem(PENDING_PREFIX + owner);
+      var keys = Object.keys(map).sort(function (a, b) { return seqOf(map[a]) - seqOf(map[b]); });
+      while (keys.length > PENDING_MAX) delete map[keys.shift()];
+      if (keys.length) localStorage.setItem(prefix + owner, JSON.stringify(map));
+      else localStorage.removeItem(prefix + owner);
     } catch (e) {}
   }
+  var itemSeq = function (item) { return item.seq; };
+  var plainSeq = function (seq) { return seq; };
+  function ackedSeq(owner, key) { return readMap(ACKED_PREFIX, owner)[key] || 0; }
   function queueWrite(owner, endpoint, options, seq) {
     if (!owner) return;
-    var pending = readPending(owner);
     var key = pendingKeyFor(endpoint, options);
+    if (ackedSeq(owner, key) >= seq) return; // a newer save already reached the server
+    var pending = readMap(PENDING_PREFIX, owner);
     if (pending[key] && pending[key].seq > seq) return; // a newer save is already queued
     pending[key] = { endpoint: endpoint, method: options.method, body: options.body, seq: seq };
-    writePending(owner, pending);
+    writeMap(PENDING_PREFIX, owner, pending, itemSeq);
   }
-  function clearQueued(owner, endpoint, options, seq) {
-    var pending = readPending(owner);
+  function markSaved(owner, endpoint, options, seq) {
     var key = pendingKeyFor(endpoint, options);
-    if (pending[key] && pending[key].seq <= seq) { delete pending[key]; writePending(owner, pending); }
+    var acked = readMap(ACKED_PREFIX, owner);
+    if ((acked[key] || 0) < seq) { acked[key] = seq; writeMap(ACKED_PREFIX, owner, acked, plainSeq); }
+    var pending = readMap(PENDING_PREFIX, owner);
+    if (pending[key] && pending[key].seq <= seq) { delete pending[key]; writeMap(PENDING_PREFIX, owner, pending, itemSeq); }
+  }
+  // Is this queued save still the newest unsent version? Checked right before sending.
+  function stillQueued(owner, endpoint, options, seq) {
+    var key = pendingKeyFor(endpoint, options);
+    var item = readMap(PENDING_PREFIX, owner)[key];
+    return !!item && item.seq === seq && ackedSeq(owner, key) < seq;
   }
 
   proto.flushQueued = async function () {
@@ -83,7 +97,7 @@
     if (!owner || tokenMemberId(this.token) !== owner) return;
     this.flushing = true;
     try {
-      var pending = readPending(owner);
+      var pending = readMap(PENDING_PREFIX, owner);
       for (var key in pending) {
         var item = pending[key];
         try {
@@ -93,19 +107,33 @@
     } finally { this.flushing = false; }
   };
 
-  proto.request = async function (endpoint, options) {
+  proto.request = function (endpoint, options) {
     options = options || {};
-    var isWrite = /^(POST|PUT|PATCH|DELETE)$/i.test(options.method || 'GET');
+    if (!/^(POST|PUT|PATCH|DELETE)$/i.test(options.method || 'GET')) return this.send(endpoint, options, false);
+    // Saves run one at a time per page, in order, so a replay and a new save of the
+    // same lesson can never overtake each other.
+    var self = this;
+    var run = (this.writeChain || Promise.resolve()).then(function () { return self.send(endpoint, options, true); });
+    this.writeChain = run.catch(function () {});
+    return run;
+  };
+
+  proto.send = async function (endpoint, options, isWrite) {
     var seq = options.seq || nextSeq();
     var fetchOptions = Object.assign({}, options);
     delete fetchOptions.owner; delete fetchOptions.seq;
     var ready = !this.authExpired && this.getMemberstackData();
-    var owner = this.memberId;
-    if (options.owner && (owner !== options.owner || tokenMemberId(this.token) !== options.owner)) {
+    if (this.memberId) this.lastOwner = this.memberId;
+    // After a sign-out in another tab the member record is gone; the save still belongs
+    // to the learner who was using this page.
+    var owner = this.memberId || this.lastOwner;
+    if (options.owner && (this.memberId !== options.owner || tokenMemberId(this.token) !== options.owner)) {
       throw new Error('Account changed'); // replay of another learner's save: never send
     }
+    if (options.seq && !stillQueued(owner, endpoint, fetchOptions, seq)) return null; // superseded
     if (!ready) {
       if (isWrite) queueWrite(owner, endpoint, fetchOptions, seq);
+      if (!this.memberId || !this.token) this.onAuthExpired();
       throw new Error('No authentication');
     }
     var self = this;
@@ -138,7 +166,7 @@
       if (response.status === 401 && this.getAuthToken() === sent) this.onAuthExpired();
       throw new Error('API Error: ' + response.status);
     }
-    if (isWrite) clearQueued(owner, endpoint, fetchOptions, seq);
+    if (isWrite) markSaved(owner, endpoint, fetchOptions, seq);
     var data = await response.json();
     var result = data.data || data;
     if (!this.flushing) this.flushQueued();

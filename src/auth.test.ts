@@ -313,8 +313,13 @@ test('a new key id while the key source is failing answers 503, not 401', async 
   assert.equal((await me(sign({ id: 'mem_rot1' }))).status, 200);
   jwksDown = true;
   now += 31 * 1000;
-  const rotated = await quietly(() => me(sign({ id: 'mem_rot2' }, { kid: 'rotated-key' })));
+  // Two requests at once with the new key id: both wait for the same failing refresh.
+  const [rotated, concurrent] = await quietly(() => Promise.all([
+    me(sign({ id: 'mem_rot2' }, { kid: 'rotated-key' })),
+    me(sign({ id: 'mem_rot2b' }, { kid: 'rotated-key' })),
+  ]));
   assert.equal(rotated.status, 503);
+  assert.equal(concurrent.status, 503);
   // Once the source recovers, an unknown key id is a plain rejection again.
   jwksDown = false;
   now += 31 * 1000;
