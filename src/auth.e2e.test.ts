@@ -1,7 +1,8 @@
 // src/auth.e2e.test.ts
-// Run with `npm run test:e2e`. Needs TEST_DATABASE_URL pointing at an EMPTY, throwaway
-// Postgres database with the schema pushed (`DATABASE_URL=$TEST_DATABASE_URL npx prisma
-// db push`); the test deletes every row it can see. Never point it at a real database.
+// Run with `npm run test:e2e`. Needs TEST_DATABASE_URL pointing at a throwaway Postgres
+// database on localhost with the schema pushed (`DATABASE_URL=$TEST_DATABASE_URL npx
+// prisma db push`). It refuses any other host and any database holding rows of
+// learners other than its own `mem_e2e…` fixtures, and only ever deletes those.
 // Drives the real app (routes, controllers, Prisma) with RS256 tokens signed by a
 // throwaway key served from a local JWKS endpoint.
 import { test, before, after } from 'node:test';
@@ -15,6 +16,7 @@ import type { PrismaClient } from '@prisma/client';
 const KID = 'e2e-key-1';
 const APP_ID = 'app_cmde998dl011d0wx92d1xae1y';
 const ISSUER = 'https://api.memberstack.com';
+const FIXTURE_PREFIX = 'mem_e2e';
 const A = 'mem_e2eLearnerA';
 const B = 'mem_e2eLearnerB';
 const signing = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -70,6 +72,10 @@ async function totalRows() {
 
 before(async () => {
   if (!dbUrl) return;
+  const host = new URL(dbUrl).hostname;
+  if (!['localhost', '127.0.0.1', '::1', '[::1]'].includes(host)) {
+    throw new Error(`refusing TEST_DATABASE_URL on ${host}: local throwaway databases only`);
+  }
   const jwk = { ...signing.publicKey.export({ format: 'jwk' }), kid: KID, alg: 'RS256', use: 'sig' };
   jwksServer = http.createServer((_req, res) => {
     res.setHeader('Content-Type', 'application/json');
@@ -82,14 +88,21 @@ before(async () => {
   process.env.MEMBERSTACK_JWKS_URL = `http://127.0.0.1:${(jwksServer.address() as AddressInfo).port}/`;
   process.env.RATE_LIMIT_MAX_REQUESTS = '1000';
   delete process.env.SKIP_AUTH;
-  delete process.env.AUTH_ALLOW_MEMBER_ID_FALLBACK;
+  delete process.env.AUTH_MEMBER_ID_FALLBACK_UNTIL;
   delete process.env.MEMBERSTACK_APP_ID;
   delete process.env.SENTRY_DSN;
 
   ({ prisma } = await import('./config/database'));
+  const foreign = { NOT: { memberId: { startsWith: FIXTURE_PREFIX } } };
+  const foreignRows = (await Promise.all([
+    prisma.lessonProgress.count({ where: foreign }), prisma.courseProgress.count({ where: foreign }),
+    prisma.lessonTodo.count({ where: foreign }), prisma.userLastLesson.count({ where: foreign }),
+  ])).reduce((a, b) => a + b, 0);
+  if (foreignRows > 0) throw new Error(`refusing: TEST_DATABASE_URL holds ${foreignRows} rows of other learners`);
+  const ours = { memberId: { startsWith: FIXTURE_PREFIX } };
   await prisma.$transaction([
-    prisma.lessonTodo.deleteMany(), prisma.lessonProgress.deleteMany(),
-    prisma.courseProgress.deleteMany(), prisma.userLastLesson.deleteMany(),
+    prisma.lessonTodo.deleteMany({ where: ours }), prisma.lessonProgress.deleteMany({ where: ours }),
+    prisma.courseProgress.deleteMany({ where: ours }), prisma.userLastLesson.deleteMany({ where: ours }),
   ]);
   const { createApp } = await import('./app');
   appServer = http.createServer(createApp());
@@ -99,12 +112,12 @@ before(async () => {
 });
 
 after(async () => {
-  if (!dbUrl) return;
-  appServer.closeAllConnections();
-  jwksServer.closeAllConnections();
-  await new Promise<void>((r) => appServer.close(() => r()));
-  await new Promise<void>((r) => jwksServer.close(() => r()));
-  await prisma.$disconnect();
+  for (const server of [appServer, jwksServer]) {
+    if (!server) continue;
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+  await prisma?.$disconnect();
 });
 
 const e2e = { skip: dbUrl ? false : 'TEST_DATABASE_URL not set' };
@@ -160,7 +173,7 @@ test('no, malformed, fabricated, expired or foreign tokens: 401, nothing read or
     ['none', {}],
     ['malformed', { Authorization: 'Bearer not.a.jwt' }],
     ['member id', { Authorization: `Bearer ${B}`, 'X-Member-ID': B }],
-    ['fabricated member id', { Authorization: `Bearer mem_${crypto.randomUUID().replace(/-/g, '')}` }],
+    ['fabricated member id', { Authorization: `Bearer ${FIXTURE_PREFIX}${crypto.randomUUID().replace(/-/g, '')}` }],
     ['expired', { Authorization: `Bearer ${token(B, -60)}` }],
     ['wrong app', { Authorization: `Bearer ${jwt.sign({ id: B }, signing.privateKey, { algorithm: 'RS256', keyid: KID, issuer: ISSUER, audience: 'app_other', expiresIn: 3600 })}` }],
     ['foreign key', { Authorization: `Bearer ${jwt.sign({ id: B }, foreign.privateKey, { algorithm: 'RS256', keyid: KID, issuer: ISSUER, audience: APP_ID, expiresIn: 3600 })}` }],

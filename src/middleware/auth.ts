@@ -15,24 +15,39 @@ function logAuthPath(path: AuthPath): void {
 }
 
 // Local development only: the learner id is taken from the request, unverified. Needs
-// NODE_ENV=development and is never on for a Railway deployment (Railway sets
-// RAILWAY_ENVIRONMENT on every service), whatever else is configured.
+// both NODE_ENV=development and AUTH_DEV_BYPASS=true, and is never on for a Railway
+// deployment (Railway sets RAILWAY_ENVIRONMENT on every service).
 export function devBypassEnabled(env: Env): boolean {
-  return env.NODE_ENV === 'development' && !env.RAILWAY_ENVIRONMENT;
+  return env.NODE_ENV === 'development' && env.AUTH_DEV_BYPASS === 'true' && !env.RAILWAY_ENVIRONMENT;
 }
 
-// Temporary, for the client cutover only: while AUTH_ALLOW_MEMBER_ID_FALLBACK is exactly
-// 'true', a bare member id (`mem_…`) is still admitted as that learner. It proves
-// nothing about who is calling, so it is off unless set, and must be removed once the
-// learning app sends Memberstack tokens.
-export function memberIdFallbackEnabled(env: Env): boolean {
-  return env.AUTH_ALLOW_MEMBER_ID_FALLBACK === 'true';
+// Temporary, for the client cutover only: while AUTH_MEMBER_ID_FALLBACK_UNTIL holds a
+// future UTC time (ISO 8601, at most 7 days ahead), a bare member id (`mem_…`) is still
+// admitted as that learner. It proves nothing about who is calling, so it ends by
+// itself at that time, can never run past FALLBACK_HARD_STOP whatever is configured,
+// and is off when unset or unparseable. Remove this code after the cutover.
+const FALLBACK_HARD_STOP = Date.parse('2026-11-30T23:59:59Z');
+const FALLBACK_MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+type FallbackState = { on: true; until: Date } | { on: false; reason: 'unset' | 'invalid' | 'expired' | 'too_far' };
+
+export function memberIdFallbackState(env: Env, now = Date.now()): FallbackState {
+  const raw = env.AUTH_MEMBER_ID_FALLBACK_UNTIL;
+  if (!raw) return { on: false, reason: 'unset' };
+  const until = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?Z$/.test(raw) ? Date.parse(raw) : NaN;
+  if (Number.isNaN(until)) return { on: false, reason: 'invalid' };
+  if (now >= until || now >= FALLBACK_HARD_STOP) return { on: false, reason: 'expired' };
+  if (until - now > FALLBACK_MAX_WINDOW_MS) return { on: false, reason: 'too_far' };
+  return { on: true, until: new Date(Math.min(until, FALLBACK_HARD_STOP)) };
 }
 
 // Logged once at startup, so the active mode can be read from the deploy log.
-export function describeAuthMode(env: Env): string {
+export function describeAuthMode(env: Env, now = Date.now()): string {
   if (devBypassEnabled(env)) return '[auth] mode=development_bypass (unverified, local only)';
-  return `[auth] mode=verified_token member_id_fallback=${memberIdFallbackEnabled(env) ? 'on' : 'off'}`;
+  const fallback = memberIdFallbackState(env, now);
+  return `[auth] mode=verified_token member_id_fallback=${
+    fallback.on ? `on until=${fallback.until.toISOString()}` : `off (${fallback.reason})`
+  }`;
 }
 
 function bearerToken(req: Request): string | undefined {
@@ -82,7 +97,7 @@ export async function authenticateUser(
       return;
     }
 
-    if (memberIdFallbackEnabled(process.env) && token.startsWith('mem_')) {
+    if (memberIdFallbackState(process.env).on && token.startsWith('mem_')) {
       logAuthPath('member_id_fallback');
       req.userId = token;
       next();

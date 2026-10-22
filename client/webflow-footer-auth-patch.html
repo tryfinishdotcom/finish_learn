@@ -6,6 +6,8 @@
   var api = window.learningAPI;
   if (!api) return;
   var proto = Object.getPrototypeOf(api);
+  var PENDING_PREFIX = 'learningAPI:pending:';
+  var PENDING_MAX = 200;
 
   // Memberstack's session token (JWT), as $memberstackDom.getMemberCookie() returns it.
   // The backend accepts only this; a member id alone proves nothing.
@@ -23,6 +25,15 @@
     } catch (e) { return null; }
   };
 
+  // Member id inside the token (unverified, only to avoid replaying one learner's queued
+  // saves under another learner's session on a shared browser).
+  function tokenMemberId(token) {
+    try {
+      var part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      return JSON.parse(atob(part + '==='.slice((part.length + 3) % 4))).id || null;
+    } catch (e) { return null; }
+  }
+
   proto.getMemberstackData = function () {
     try {
       var member = JSON.parse(localStorage.getItem('_ms-mem') || 'null');
@@ -32,30 +43,91 @@
     return !!(this.memberId && this.token);
   };
 
+  // Saves that did not reach the backend, per learner, latest per lesson/course. They
+  // are sent again after the next successful backend call.
+  function pendingKeyFor(endpoint, options) {
+    var lesson = '';
+    try { lesson = JSON.parse(options.body || '{}').lessonSlug || ''; } catch (e) {}
+    return (options.method || 'GET').toUpperCase() + ' ' + endpoint + (lesson ? ' ' + lesson : '');
+  }
+  function readPending(memberId) {
+    try { return JSON.parse(localStorage.getItem(PENDING_PREFIX + memberId) || '{}'); } catch (e) { return {}; }
+  }
+  function writePending(memberId, pending) {
+    try {
+      var keys = Object.keys(pending).sort(function (a, b) { return pending[a].ts - pending[b].ts; });
+      while (keys.length > PENDING_MAX) delete pending[keys.shift()];
+      if (keys.length) localStorage.setItem(PENDING_PREFIX + memberId, JSON.stringify(pending));
+      else localStorage.removeItem(PENDING_PREFIX + memberId);
+    } catch (e) {}
+  }
+  proto.queueWrite = function (endpoint, options) {
+    if (!this.memberId) return;
+    var pending = readPending(this.memberId);
+    pending[pendingKeyFor(endpoint, options)] = { endpoint: endpoint, method: options.method, body: options.body, ts: Date.now() };
+    writePending(this.memberId, pending);
+  };
+  proto.clearQueued = function (endpoint, options) {
+    if (!this.memberId) return;
+    var pending = readPending(this.memberId);
+    var key = pendingKeyFor(endpoint, options);
+    if (pending[key]) { delete pending[key]; writePending(this.memberId, pending); }
+  };
+  proto.flushQueued = async function () {
+    if (this.flushing || !this.memberId || tokenMemberId(this.token) !== this.memberId) return;
+    this.flushing = true;
+    try {
+      var pending = readPending(this.memberId);
+      for (var key in pending) {
+        var item = pending[key];
+        try { await this.request(item.endpoint, { method: item.method, body: item.body }); } catch (e) { break; }
+      }
+    } finally { this.flushing = false; }
+  };
+
   proto.request = async function (endpoint, options) {
     options = options || {};
-    if (this.authExpired || !this.getMemberstackData()) throw new Error('No authentication');
+    var isWrite = /^(POST|PUT|PATCH|DELETE)$/i.test(options.method || 'GET');
+    if (this.authExpired || !this.getMemberstackData()) {
+      if (isWrite) this.queueWrite(endpoint, options);
+      throw new Error('No authentication');
+    }
     var self = this;
     var send = function (token) {
       return fetch(self.baseURL + endpoint, Object.assign({}, options, {
         headers: Object.assign({ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, options.headers)
       }));
     };
-    var response = await send(this.token);
-    if (response.status === 401) {
-      // Memberstack may have renewed the session meanwhile: ask it once, retry once.
-      try { if (window.$memberstackDom) await window.$memberstackDom.getCurrentMember(); } catch (e) {}
-      var fresh = this.getAuthToken();
-      if (fresh && fresh !== this.token) { this.token = fresh; response = await send(fresh); }
+    var sent = this.token;
+    var response;
+    try {
+      response = await send(sent);
+      if (response.status === 401) {
+        // Memberstack may have renewed the session meanwhile: ask it once, and retry
+        // once if the token now differs from the one this request sent.
+        try { if (window.$memberstackDom) await window.$memberstackDom.getCurrentMember(); } catch (e) {}
+        var fresh = this.getAuthToken();
+        if (fresh && fresh !== sent) { sent = fresh; this.token = fresh; response = await send(fresh); }
+      }
+    } catch (networkError) {
+      if (isWrite) this.queueWrite(endpoint, options);
+      throw networkError;
     }
-    if (response.status === 401) this.onAuthExpired();
-    if (!response.ok) throw new Error('API Error: ' + response.status);
+    if (!response.ok) {
+      if (isWrite) this.queueWrite(endpoint, options);
+      // Only the newest token can expire the session; a late 401 for an older token
+      // must not lock out a session that has since been renewed.
+      if (response.status === 401 && this.getAuthToken() === sent) this.onAuthExpired();
+      throw new Error('API Error: ' + response.status);
+    }
+    if (isWrite) this.clearQueued(endpoint, options);
+    if (!this.flushing) this.flushQueued();
     var data = await response.json();
     return data.data || data;
   };
 
-  // Session no longer valid: stop calling the backend from this page (progress stays in
-  // localStorage and syncs after the next sign-in) and offer the Memberstack login once.
+  // Session no longer valid: stop calling the backend from this page (saves are queued
+  // and sent after the next sign-in) and offer the Memberstack login once.
   proto.onAuthExpired = function () {
     if (this.authExpired) return;
     this.authExpired = true;
