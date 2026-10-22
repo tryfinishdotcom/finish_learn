@@ -36,11 +36,25 @@ function jwksClientFor(uri: string): jwksRsa.JwksClient {
   return client;
 }
 
+// Thrown when Memberstack's signing keys cannot be fetched (network error, key source
+// down). The token may well be valid, so callers answer 503, not 401: a 401 tells the
+// client to sign the learner in again, which would not help.
+export class KeySourceUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super(`Memberstack signing keys unavailable: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'KeySourceUnavailableError';
+  }
+}
+
 export async function verifyMemberstackToken(token: string): Promise<jwt.JwtPayload & { id: string }> {
   const { jwksUri, issuer, audience } = memberstackConfig(process.env);
   const client = jwksClientFor(jwksUri);
+  let keySourceError: unknown;
   const getKey: jwt.GetPublicKeyOrSecret = (header, callback) => {
     client.getSigningKey(header.kid, (err, key) => {
+      // An unknown key id means the token was not signed by Memberstack: a plain
+      // verification failure. Any other error means the key source itself failed.
+      if (err && !(err instanceof jwksRsa.SigningKeyNotFoundError)) keySourceError = err;
       if (err) callback(err);
       else callback(null, key?.getPublicKey());
     });
@@ -48,7 +62,7 @@ export async function verifyMemberstackToken(token: string): Promise<jwt.JwtPayl
 
   const decoded = await new Promise<jwt.JwtPayload>((resolve, reject) => {
     jwt.verify(token, getKey, { algorithms: ['RS256'], issuer, audience }, (err, payload) => {
-      if (err) reject(err);
+      if (err) reject(keySourceError ? new KeySourceUnavailableError(keySourceError) : err);
       else resolve(payload as jwt.JwtPayload);
     });
   });
@@ -61,13 +75,4 @@ export async function verifyMemberstackToken(token: string): Promise<jwt.JwtPayl
     throw new jwt.JsonWebTokenError('jwt has no member id');
   }
   return decoded as jwt.JwtPayload & { id: string };
-}
-
-export function extractMemberId(token: string): string | null {
-  try {
-    const decoded = jwt.decode(token) as any;
-    return decoded?.id || null;
-  } catch {
-    return null;
-  }
 }

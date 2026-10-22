@@ -30,7 +30,9 @@ export function createApp(): Express {
     origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Member-ID'] // ADD X-Member-ID here
+    // X-Member-ID stays allowed so the current learning app's preflight passes; the
+    // backend never takes the learner's identity from it outside local development.
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Member-ID']
   }));
 
   // Body parsing and compression

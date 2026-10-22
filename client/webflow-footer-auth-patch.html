@@ -1,0 +1,75 @@
+<!-- finish_learn: learning app sends the Memberstack session token (2026-10).
+     Paste at the END of Webflow > Site settings > Custom code > Footer code, below the
+     existing LearningPlatformAPI script. Same block on all three sites. -->
+<script>
+(function () {
+  var api = window.learningAPI;
+  if (!api) return;
+  var proto = Object.getPrototypeOf(api);
+
+  // Memberstack's session token (JWT), as $memberstackDom.getMemberCookie() returns it.
+  // The backend accepts only this; a member id alone proves nothing.
+  proto.getAuthToken = function () {
+    try {
+      var ms = window.$memberstackDom;
+      var t = ms && ms.getMemberCookie && ms.getMemberCookie();
+      if (t) return t;
+    } catch (e) {}
+    try {
+      var stored = localStorage.getItem('_ms-mid');
+      if (stored) return stored;
+      var m = document.cookie.match(/(?:^|;\s*)_ms-mid=([^;]+)/);
+      return m ? decodeURIComponent(m[1]) : null;
+    } catch (e) { return null; }
+  };
+
+  proto.getMemberstackData = function () {
+    try {
+      var member = JSON.parse(localStorage.getItem('_ms-mem') || 'null');
+      this.memberId = member && member.id ? member.id : null;
+    } catch (e) { this.memberId = null; }
+    this.token = this.memberId ? this.getAuthToken() : null;
+    return !!(this.memberId && this.token);
+  };
+
+  proto.request = async function (endpoint, options) {
+    options = options || {};
+    if (this.authExpired || !this.getMemberstackData()) throw new Error('No authentication');
+    var self = this;
+    var send = function (token) {
+      return fetch(self.baseURL + endpoint, Object.assign({}, options, {
+        headers: Object.assign({ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, options.headers)
+      }));
+    };
+    var response = await send(this.token);
+    if (response.status === 401) {
+      // Memberstack may have renewed the session meanwhile: ask it once, retry once.
+      try { if (window.$memberstackDom) await window.$memberstackDom.getCurrentMember(); } catch (e) {}
+      var fresh = this.getAuthToken();
+      if (fresh && fresh !== this.token) { this.token = fresh; response = await send(fresh); }
+    }
+    if (response.status === 401) this.onAuthExpired();
+    if (!response.ok) throw new Error('API Error: ' + response.status);
+    var data = await response.json();
+    return data.data || data;
+  };
+
+  // Session no longer valid: stop calling the backend from this page (progress stays in
+  // localStorage and syncs after the next sign-in) and offer the Memberstack login once.
+  proto.onAuthExpired = function () {
+    if (this.authExpired) return;
+    this.authExpired = true;
+    var ms = window.$memberstackDom;
+    if (!ms || !ms.getCurrentMember) return;
+    Promise.resolve(ms.getCurrentMember()).then(function (res) {
+      if (!(res && res.data) && ms.openModal) ms.openModal('LOGIN');
+    }).catch(function () {});
+  };
+
+  try {
+    if (window.$memberstackDom && window.$memberstackDom.onAuthChange) {
+      window.$memberstackDom.onAuthChange(function () { api.authExpired = false; });
+    }
+  } catch (e) {}
+})();
+</script>

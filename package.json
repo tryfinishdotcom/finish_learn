@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "start:prod": "node dist/index.js",
     "test": "tsx --test src/app.test.ts src/auth.test.ts",
+    "test:e2e": "tsx --test src/auth.e2e.test.ts",
     "typecheck": "tsc --noEmit",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",
