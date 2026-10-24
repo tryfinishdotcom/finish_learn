@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 
 import { prisma } from './config/database';
 import { createApp } from './app';
+import { describeAuthMode } from './middleware/auth';
 
 dotenv.config();
 
@@ -19,4 +20,5 @@ process.on('SIGTERM', async () => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📊 Environment: ${process.env.NODE_ENV}`);
+  console.log(describeAuthMode(process.env));
 });

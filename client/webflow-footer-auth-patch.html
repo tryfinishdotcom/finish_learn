@@ -1,0 +1,262 @@
+<!-- finish_learn: learning app sends the Memberstack session token (2026-10).
+     Paste at the END of Webflow > Site settings > Custom code > Footer code, below the
+     existing LearningPlatformAPI script. Same block on all three sites. -->
+<script>
+(function () {
+  var api = window.learningAPI;
+  if (!api) return;
+  var proto = Object.getPrototypeOf(api);
+  var PENDING_PREFIX = 'learningAPI:pending:';
+  var PENDING_MAX = 200;
+  var lastSeq = 0;
+  function nextSeq() { lastSeq = Math.max(Date.now(), lastSeq + 1); return lastSeq; }
+
+  // Memberstack's session token (JWT), as $memberstackDom.getMemberCookie() returns it.
+  // The backend accepts only this; a member id alone proves nothing.
+  proto.getAuthToken = function () {
+    try {
+      var ms = window.$memberstackDom;
+      var t = ms && ms.getMemberCookie && ms.getMemberCookie();
+      if (t) return t;
+    } catch (e) {}
+    try {
+      var stored = localStorage.getItem('_ms-mid');
+      if (stored) return stored;
+      var m = document.cookie.match(/(?:^|;\s*)_ms-mid=([^;]+)/);
+      return m ? decodeURIComponent(m[1]) : null;
+    } catch (e) { return null; }
+  };
+
+  // Member id inside the token (unverified; only used so one learner's queued saves are
+  // never sent under another learner's session on a shared browser).
+  function tokenMemberId(token) {
+    try {
+      var part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      return JSON.parse(atob(part + '==='.slice((part.length + 3) % 4))).id || null;
+    } catch (e) { return null; }
+  }
+
+  function currentMemberId() {
+    try {
+      var member = JSON.parse(localStorage.getItem('_ms-mem') || 'null');
+      return member && member.id ? member.id : null;
+    } catch (e) { return null; }
+  }
+
+  // The learner this page was opened for. What the page shows and saves (including the
+  // shared progressByLesson / courseProgress / lastLesson / todos:* store) is theirs; it
+  // is never sent under another learner. The store is labelled with its learner; when
+  // someone else opens the app in this browser it is set aside for its learner and that
+  // learner gets it back on their next visit.
+  var STORE_OWNER = 'learningAPI:storeOwner';
+  var STASH_PREFIX = 'learningAPI:store:';
+  var pageOwner = currentMemberId();
+  var reloading = false;
+  function isStoreKey(k) {
+    return k === 'progressByLesson' || k === 'courseProgress' || k === 'lastLesson' || k === 'todos' || k.indexOf('todos:') === 0;
+  }
+  function bindStore(id) {
+    try {
+      var labelled = localStorage.getItem(STORE_OWNER);
+      if (labelled !== id) {
+        if (labelled) {
+          var stash = {};
+          Object.keys(localStorage).filter(isStoreKey).forEach(function (k) {
+            stash[k] = localStorage.getItem(k);
+            localStorage.removeItem(k);
+          });
+          try { localStorage.setItem(STASH_PREFIX + labelled, JSON.stringify(stash)); } catch (e) {} // full: dropped, never shown to another learner
+        }
+        var own = JSON.parse(localStorage.getItem(STASH_PREFIX + id) || 'null');
+        if (own) {
+          Object.keys(own).forEach(function (k) { if (isStoreKey(k)) localStorage.setItem(k, own[k]); });
+          localStorage.removeItem(STASH_PREFIX + id);
+        }
+      }
+      localStorage.setItem(STORE_OWNER, id);
+    } catch (e) {}
+  }
+  if (pageOwner) bindStore(pageOwner);
+
+  // Someone else is signed in now (other tab, or a sign-in on this page). A page opened
+  // signed out takes the learner on if the store is theirs (or unlabelled); otherwise the
+  // page is reloaded once, so it starts over with the new learner's data.
+  function learnerChanged(id) {
+    if (!id || id === pageOwner || reloading) return;
+    var labelled = null;
+    try { labelled = localStorage.getItem(STORE_OWNER); } catch (e) {}
+    if (!pageOwner && (!labelled || labelled === id)) { pageOwner = id; bindStore(id); return; }
+    if (!pageOwner) bindStore(id); // nothing of this page's learner left to protect
+    reloading = true; // from here on this page takes on no other learner
+    try { window.location.reload(); } catch (e) {}
+  }
+
+  proto.getMemberstackData = function () {
+    try {
+      var member = JSON.parse(localStorage.getItem('_ms-mem') || 'null');
+      this.memberId = member && member.id ? member.id : null;
+    } catch (e) { this.memberId = null; }
+    this.token = this.memberId ? this.getAuthToken() : null;
+    return !!(this.memberId && this.token);
+  };
+
+  // Saves that did not reach the backend, per learner, one entry per lesson/course with
+  // the time the save was made. Per learner we also remember the newest save time that
+  // succeeded per lesson/course, so an older save is never queued or sent after it.
+  var ACKED_PREFIX = 'learningAPI:acked:';
+  function pendingKeyFor(endpoint, options) {
+    var lesson = '';
+    try { lesson = JSON.parse(options.body || '{}').lessonSlug || ''; } catch (e) {}
+    return (options.method || 'GET').toUpperCase() + ' ' + endpoint + (lesson ? ' ' + lesson : '');
+  }
+  function readMap(prefix, owner) {
+    try { return JSON.parse(localStorage.getItem(prefix + owner) || '{}'); } catch (e) { return {}; }
+  }
+  function writeMap(prefix, owner, map, seqOf) {
+    try {
+      var keys = Object.keys(map).sort(function (a, b) { return seqOf(map[a]) - seqOf(map[b]); });
+      while (keys.length > PENDING_MAX) delete map[keys.shift()];
+      if (keys.length) localStorage.setItem(prefix + owner, JSON.stringify(map));
+      else localStorage.removeItem(prefix + owner);
+    } catch (e) {}
+  }
+  var itemSeq = function (item) { return item.seq; };
+  var plainSeq = function (seq) { return seq; };
+  function ackedSeq(owner, key) { return readMap(ACKED_PREFIX, owner)[key] || 0; }
+  function queueWrite(owner, endpoint, options, seq) {
+    if (!owner) return;
+    var key = pendingKeyFor(endpoint, options);
+    if (ackedSeq(owner, key) >= seq) return; // a newer save already reached the server
+    var pending = readMap(PENDING_PREFIX, owner);
+    if (pending[key] && pending[key].seq > seq) return; // a newer save is already queued
+    pending[key] = { endpoint: endpoint, method: options.method, body: options.body, seq: seq };
+    writeMap(PENDING_PREFIX, owner, pending, itemSeq);
+  }
+  function markSaved(owner, endpoint, options, seq) {
+    var key = pendingKeyFor(endpoint, options);
+    var acked = readMap(ACKED_PREFIX, owner);
+    if ((acked[key] || 0) < seq) { acked[key] = seq; writeMap(ACKED_PREFIX, owner, acked, plainSeq); }
+    var pending = readMap(PENDING_PREFIX, owner);
+    if (pending[key] && pending[key].seq <= seq) { delete pending[key]; writeMap(PENDING_PREFIX, owner, pending, itemSeq); }
+  }
+  // Is this queued save still the newest unsent version? Checked right before sending.
+  function stillQueued(owner, endpoint, options, seq) {
+    var key = pendingKeyFor(endpoint, options);
+    var item = readMap(PENDING_PREFIX, owner)[key];
+    return !!item && item.seq === seq && ackedSeq(owner, key) < seq;
+  }
+
+  proto.flushQueued = async function () {
+    if (this.flushing) return;
+    var owner = pageOwner;
+    if (!owner || this.memberId !== owner || tokenMemberId(this.token) !== owner) return;
+    this.flushing = true;
+    try {
+      var pending = readMap(PENDING_PREFIX, owner);
+      for (var key in pending) {
+        var item = pending[key];
+        try {
+          await this.request(item.endpoint, { method: item.method, body: item.body, owner: owner, seq: item.seq });
+        } catch (e) { break; }
+      }
+    } finally { this.flushing = false; }
+  };
+
+  proto.request = function (endpoint, options) {
+    options = options || {};
+    learnerChanged(currentMemberId());
+    // Bound now, before any waiting: the learner this call was made for. A replay
+    // carries the learner it was queued for.
+    var owner = options.owner || pageOwner;
+    if (!/^(POST|PUT|PATCH|DELETE)$/i.test(options.method || 'GET')) return this.send(endpoint, options, false, owner);
+    // Saves run one at a time per page, in order, so a replay and a new save of the
+    // same lesson can never overtake each other.
+    var self = this;
+    var run = (this.writeChain || Promise.resolve()).then(function () { return self.send(endpoint, options, true, owner); });
+    this.writeChain = run.catch(function () {});
+    return run;
+  };
+
+  proto.send = async function (endpoint, options, isWrite, owner) {
+    var seq = options.seq || nextSeq();
+    var fetchOptions = Object.assign({}, options);
+    delete fetchOptions.owner; delete fetchOptions.seq;
+    var ready = this.getMemberstackData() && !this.authExpired;
+    // Sent only with the session of the learner the call belongs to; anything else is
+    // kept for that learner (never for whoever is signed in now) and not sent.
+    if (this.memberId && (this.memberId !== owner || (ready && tokenMemberId(this.token) !== owner))) {
+      if (isWrite) queueWrite(owner, endpoint, fetchOptions, seq);
+      learnerChanged(this.memberId);
+      throw new Error('Account changed');
+    }
+    if (options.seq && !stillQueued(owner, endpoint, fetchOptions, seq)) return null; // superseded
+    if (!ready) {
+      // Signed out (here or in another tab): kept for this page's learner, login offered.
+      if (isWrite) queueWrite(owner, endpoint, fetchOptions, seq);
+      if (!this.memberId || !this.token) this.onAuthExpired();
+      throw new Error('No authentication');
+    }
+    var self = this;
+    var send = function (token) {
+      return fetch(self.baseURL + endpoint, Object.assign({}, fetchOptions, {
+        headers: Object.assign({ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, fetchOptions.headers)
+      }));
+    };
+    var sent = this.token;
+    var response;
+    try {
+      response = await send(sent);
+      if (response.status === 401) {
+        // Memberstack may have renewed the session meanwhile: ask it once, and retry
+        // once if the token now differs and still belongs to this call's learner.
+        try { if (window.$memberstackDom) await window.$memberstackDom.getCurrentMember(); } catch (e) {}
+        var fresh = this.getAuthToken();
+        if (fresh && fresh !== sent && tokenMemberId(fresh) === owner && currentMemberId() === owner) {
+          sent = fresh; this.token = fresh; response = await send(fresh);
+        }
+      }
+    } catch (networkError) {
+      if (isWrite) queueWrite(owner, endpoint, fetchOptions, seq);
+      throw networkError;
+    }
+    if (!response.ok) {
+      if (isWrite) queueWrite(owner, endpoint, fetchOptions, seq);
+      // Only the newest token can expire the session; a late 401 for an older token
+      // must not lock out a session that has since been renewed.
+      if (response.status === 401 && this.getAuthToken() === sent) this.onAuthExpired();
+      throw new Error('API Error: ' + response.status);
+    }
+    if (isWrite) markSaved(owner, endpoint, fetchOptions, seq);
+    var data = await response.json();
+    var result = data.data || data;
+    if (!this.flushing) this.flushQueued();
+    return result;
+  };
+
+  // Session no longer valid: stop calling the backend from this page (saves are queued
+  // and sent after the next sign-in) and offer the Memberstack login once.
+  proto.onAuthExpired = function () {
+    if (this.authExpired) return;
+    this.authExpired = true;
+    var ms = window.$memberstackDom;
+    if (!ms || !ms.getCurrentMember) return;
+    Promise.resolve(ms.getCurrentMember()).then(function (res) {
+      if (!(res && res.data) && ms.openModal) ms.openModal('LOGIN');
+    }).catch(function () {});
+  };
+
+  try {
+    if (window.$memberstackDom && window.$memberstackDom.onAuthChange) {
+      window.$memberstackDom.onAuthChange(function (member) {
+        api.authExpired = false;
+        var m = member && (member.data || member);
+        learnerChanged((m && m.id) || currentMemberId());
+      });
+    }
+    // Sign-in or sign-out in another tab.
+    window.addEventListener('storage', function (e) {
+      if (e.key === '_ms-mem') learnerChanged(currentMemberId());
+    });
+  } catch (e) {}
+})();
+</script>

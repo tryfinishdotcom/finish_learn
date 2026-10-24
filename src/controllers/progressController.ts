@@ -9,29 +9,28 @@ export const progressController = {
       const { lessonSlug, courseSlug, secondsWatched, totalDuration, percentComplete, url, title, headline, index } = req.body;
       const memberId = req.userId!;
 
-      const progress = await prisma.lessonProgress.upsert({
-        where: {
-          memberId_lessonSlug: { memberId, lessonSlug }
-        },
-        update: {
-          courseSlug,
-          secondsWatched,
-          totalDuration,
-          percentComplete,
-          lastPosition: secondsWatched,
-          completedAt: percentComplete >= 90 ? new Date() : null
-        },
-        create: {
-          memberId,
-          lessonSlug,
-          courseSlug,
-          secondsWatched,
-          totalDuration,
-          percentComplete,
-          lastPosition: secondsWatched,
-          completedAt: percentComplete >= 90 ? new Date() : null
-        }
-      });
+      // Progress never moves backwards: a late or replayed save with lower values (an old
+      // tab, a queued retry) keeps the higher values already stored, and a lesson stays
+      // completed once completed. One atomic statement, so concurrent saves cannot race.
+      const completedAt = Number(percentComplete) >= 90 ? new Date() : null;
+      const [progress] = await prisma.$queryRaw<Record<string, unknown>[]>`
+        INSERT INTO lesson_progress
+          (member_id, lesson_slug, course_slug, seconds_watched, total_duration, percent_complete,
+           last_position, completed_at, created_at, updated_at)
+        VALUES (${memberId}, ${lessonSlug}, ${courseSlug}, ${secondsWatched}::int, ${totalDuration}::int,
+          ${percentComplete}::int, ${secondsWatched}::int, ${completedAt}, now(), now())
+        ON CONFLICT (member_id, lesson_slug) DO UPDATE SET
+          course_slug = EXCLUDED.course_slug,
+          seconds_watched = GREATEST(lesson_progress.seconds_watched, EXCLUDED.seconds_watched),
+          total_duration = GREATEST(lesson_progress.total_duration, EXCLUDED.total_duration),
+          percent_complete = GREATEST(lesson_progress.percent_complete, EXCLUDED.percent_complete),
+          last_position = GREATEST(lesson_progress.last_position, EXCLUDED.last_position),
+          completed_at = COALESCE(lesson_progress.completed_at, EXCLUDED.completed_at),
+          updated_at = now()
+        RETURNING id, member_id AS "memberId", lesson_slug AS "lessonSlug", course_slug AS "courseSlug",
+          seconds_watched AS "secondsWatched", total_duration AS "totalDuration",
+          percent_complete AS "percentComplete", last_position AS "lastPosition",
+          completed_at AS "completedAt", created_at AS "createdAt", updated_at AS "updatedAt"`;
 
       // Also update course progress
       await prisma.courseProgress.upsert({
